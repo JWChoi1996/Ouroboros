@@ -1,0 +1,458 @@
+diff --git a/libavcodec/avcodec.h b/libavcodec/avcodec.h
+index 108df5a..512eb8a 100644
+--- a/libavcodec/avcodec.h
++++ b/libavcodec/avcodec.h
+@@ -335,6 +335,15 @@ typedef struct RcOverride{
+  * Allow non spec compliant speedup tricks.
+  */
+ #define AV_CODEC_FLAG2_FAST           (1 <<  0)
++/**
++ * Export Ouroboros H.264 effective residual side data.
++ * Internal instrumentation in the patched Ouroboros build.
++ */
++#define AV_CODEC_FLAG2_EXPORT_OUROBOROS_RESIDUAL (1 << 1)
++/**
++ * Include prediction and pre-filter reconstruction validation planes.
++ */
++#define AV_CODEC_FLAG2_EXPORT_OUROBOROS_VALIDATION (1 << 4)
+ /**
+  * Skip bitstream encoding.
+  */
+diff --git a/libavcodec/h264_mb.c b/libavcodec/h264_mb.c
+index 0d6562b..e066248 100644
+--- a/libavcodec/h264_mb.c
++++ b/libavcodec/h264_mb.c
+@@ -33,6 +33,7 @@
+ #include "avcodec.h"
+ #include "h264dec.h"
+ #include "h264_ps.h"
++#include "ouroboros_h264_residual.h"
+ #include "qpeldsp.h"
+ #include "rectangle.h"
+ #include "threadframe.h"
+diff --git a/libavcodec/h264_mb_template.c b/libavcodec/h264_mb_template.c
+index d5ea26a..e00aaf8 100644
+--- a/libavcodec/h264_mb_template.c
++++ b/libavcodec/h264_mb_template.c
+@@ -52,6 +52,52 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+     void (*idct_add)(uint8_t *dst, int16_t *block, int stride);
+     const int block_h   = 16 >> h->chroma_y_shift;
+     const int chroma422 = CHROMA422(h);
++    uint8_t prediction_y[16 * 16];
++    uint8_t prediction_u[8 * 8];
++    uint8_t prediction_v[8 * 8];
++    OuroborosResidualHeader *residual_header = NULL;
++
++    {
++        AVFrameSideData *side =
++            ff_ouroboros_residual_side_data(h->cur_pic.f);
++        if (side) {
++            float *row;
++            int64_t coefficient_sum = 0;
++            uint64_t coefficient_abs_sum = 0;
++            int coefficient_count = 256;
++            int nonzero = 0;
++
++            residual_header = (OuroborosResidualHeader *)side->data;
++            row = ff_ouroboros_coefficient_summaries(residual_header) +
++                  ((size_t)mb_y * residual_header->mb_width + mb_x) *
++                  OUROBOROS_RESIDUAL_COLUMNS;
++            for (i = 0; i < 256; i++) {
++                const int coefficient =
++                    dctcoef_get(sl->mb, PIXEL_SHIFT, i);
++                coefficient_sum += coefficient;
++                coefficient_abs_sum += coefficient < 0 ?
++                                       -(int64_t)coefficient : coefficient;
++                nonzero += coefficient != 0;
++            }
++            if (IS_INTRA16x16(mb_type)) {
++                for (i = 0; i < 16; i++) {
++                    const int coefficient =
++                        dctcoef_get(sl->mb_luma_dc[0], PIXEL_SHIFT, i);
++                    coefficient_sum += coefficient;
++                    coefficient_abs_sum += coefficient < 0 ?
++                                           -(int64_t)coefficient : coefficient;
++                    nonzero += coefficient != 0;
++                }
++                coefficient_count += 16;
++            }
++            row[4] = coefficient_sum / (float)coefficient_count;
++            row[5] = coefficient_abs_sum / (float)coefficient_count;
++            row[6] = nonzero;
++            row[7] = sl->qscale;
++            row[8] = sl->cbp & 15;
++            row[9] = !IS_INTRA(mb_type);
++        }
++    }
+ 
+     dest_y  = h->cur_pic.f->data[0] + ((mb_x << PIXEL_SHIFT)     + mb_y * sl->linesize)  * 16;
+     dest_cb = h->cur_pic.f->data[1] +  (mb_x << PIXEL_SHIFT) * 8 + mb_y * sl->uvlinesize * block_h;
+@@ -187,6 +233,16 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+             }
+         }
+ 
++        if (residual_header && !PIXEL_SHIFT && !chroma422 &&
++            block_h == 8 && !MB_FIELD(sl)) {
++            for (i = 0; i < 16; i++)
++                memcpy(prediction_y + i * 16, dest_y + i * linesize, 16);
++            for (i = 0; i < 8; i++) {
++                memcpy(prediction_u + i * 8, dest_cb + i * uvlinesize, 8);
++                memcpy(prediction_v + i * 8, dest_cr + i * uvlinesize, 8);
++            }
++        }
++
+         hl_decode_mb_idct_luma(h, sl, mb_type, SIMPLE, transform_bypass,
+                                PIXEL_SHIFT, block_offset, linesize, dest_y, 0);
+ 
+@@ -244,6 +300,71 @@ static av_noinline void FUNC(hl_decode_mb)(const H264Context *h, H264SliceContex
+                                           sl->non_zero_count_cache);
+             }
+         }
++
++        if (residual_header && !PIXEL_SHIFT && !chroma422 &&
++            block_h == 8 && !MB_FIELD(sl)) {
++            int16_t *residual_y =
++                ff_ouroboros_residual_y(residual_header);
++            int16_t *residual_u =
++                ff_ouroboros_residual_u(residual_header);
++            int16_t *residual_v =
++                ff_ouroboros_residual_v(residual_header);
++            uint8_t *valid_y = ff_ouroboros_valid_y(residual_header);
++            uint8_t *valid_u = ff_ouroboros_valid_u(residual_header);
++            uint8_t *valid_v = ff_ouroboros_valid_v(residual_header);
++            const int y_width =
++                FFMIN(16, (int)residual_header->width - mb_x * 16);
++            const int y_height =
++                FFMIN(16, (int)residual_header->height - mb_y * 16);
++            const int c_width =
++                FFMIN(8, (int)residual_header->chroma_width - mb_x * 8);
++            const int c_height =
++                FFMIN(8, (int)residual_header->chroma_height - mb_y * 8);
++
++            for (i = 0; i < y_height; i++) {
++                for (j = 0; j < y_width; j++) {
++                    const size_t offset =
++                        (size_t)(mb_y * 16 + i) * residual_header->width +
++                        mb_x * 16 + j;
++                    residual_y[offset] =
++                        (int16_t)dest_y[i * linesize + j] -
++                        (int16_t)prediction_y[i * 16 + j];
++                    valid_y[offset] = 1;
++                    if (residual_header->flags &
++                        OUROBOROS_RESIDUAL_FLAG_VALIDATION) {
++                        ff_ouroboros_prediction_y(residual_header)[offset] =
++                            prediction_y[i * 16 + j];
++                        ff_ouroboros_reconstruction_y(residual_header)[offset] =
++                            dest_y[i * linesize + j];
++                    }
++                }
++            }
++            for (i = 0; i < c_height; i++) {
++                for (j = 0; j < c_width; j++) {
++                    const size_t offset =
++                        (size_t)(mb_y * 8 + i) *
++                        residual_header->chroma_width + mb_x * 8 + j;
++                    residual_u[offset] =
++                        (int16_t)dest_cb[i * uvlinesize + j] -
++                        (int16_t)prediction_u[i * 8 + j];
++                    residual_v[offset] =
++                        (int16_t)dest_cr[i * uvlinesize + j] -
++                        (int16_t)prediction_v[i * 8 + j];
++                    valid_u[offset] = valid_v[offset] = 1;
++                    if (residual_header->flags &
++                        OUROBOROS_RESIDUAL_FLAG_VALIDATION) {
++                        ff_ouroboros_prediction_u(residual_header)[offset] =
++                            prediction_u[i * 8 + j];
++                        ff_ouroboros_prediction_v(residual_header)[offset] =
++                            prediction_v[i * 8 + j];
++                        ff_ouroboros_reconstruction_u(residual_header)[offset] =
++                            dest_cb[i * uvlinesize + j];
++                        ff_ouroboros_reconstruction_v(residual_header)[offset] =
++                            dest_cr[i * uvlinesize + j];
++                    }
++                }
++            }
++        }
+     }
+ }
+ 
+diff --git a/libavcodec/h264_slice.c b/libavcodec/h264_slice.c
+index 7e53e38..db86ea6 100644
+--- a/libavcodec/h264_slice.c
++++ b/libavcodec/h264_slice.c
+@@ -38,6 +38,7 @@
+ #include "avcodec.h"
+ #include "h264.h"
+ #include "h264dec.h"
++#include "ouroboros_h264_residual.h"
+ #include "h264data.h"
+ #include "h264chroma.h"
+ #include "h264_ps.h"
+@@ -204,6 +205,61 @@ static int alloc_picture(H264Context *h, H264Picture *pic)
+     if (ret < 0)
+         goto fail;
+ 
++    if (h->avctx->flags2 & AV_CODEC_FLAG2_EXPORT_OUROBOROS_RESIDUAL) {
++        AVFrameSideData *side;
++        OuroborosResidualHeader *header;
++        float *coefficient_summaries;
++        uint32_t flags = 0;
++        size_t payload_size;
++        size_t index;
++
++        if (h->ps.sps->bit_depth_luma != 8 ||
++            h->ps.sps->bit_depth_chroma != 8 ||
++            h->ps.sps->chroma_format_idc != 1) {
++            av_log(h->avctx, AV_LOG_ERROR,
++                   "Ouroboros residual export supports only 8-bit YUV420P\n");
++            ret = AVERROR_PATCHWELCOME;
++            goto fail;
++        }
++        if (h->avctx->flags2 & AV_CODEC_FLAG2_EXPORT_OUROBOROS_VALIDATION)
++            flags |= OUROBOROS_RESIDUAL_FLAG_VALIDATION;
++        payload_size = ff_ouroboros_payload_size(
++            pic->f->width, pic->f->height, flags);
++        side = av_frame_new_side_data(
++            pic->f, AV_FRAME_DATA_OUROBOROS_H264_RESIDUAL, payload_size);
++        if (!side) {
++            ret = AVERROR(ENOMEM);
++            goto fail;
++        }
++        memset(side->data, 0, side->size);
++        header = (OuroborosResidualHeader *)side->data;
++        memcpy(header->uuid, ff_ouroboros_residual_uuid,
++               sizeof(header->uuid));
++        header->version = OUROBOROS_RESIDUAL_VERSION;
++        header->width = pic->f->width;
++        header->height = pic->f->height;
++        header->chroma_width = (pic->f->width + 1) / 2;
++        header->chroma_height = (pic->f->height + 1) / 2;
++        header->mb_width = h->mb_width;
++        header->mb_height = h->mb_height;
++        header->flags = flags;
++        header->payload_bytes = payload_size;
++        coefficient_summaries =
++            ff_ouroboros_coefficient_summaries(header);
++        for (index = 0;
++             index < (size_t)header->mb_width * header->mb_height;
++             index++) {
++            float *row = coefficient_summaries +
++                         index * OUROBOROS_RESIDUAL_COLUMNS;
++            const int x = (index % header->mb_width) * 16;
++            const int y = (index / header->mb_width) * 16;
++            row[0] = x;
++            row[1] = y;
++            row[2] = FFMIN(16, (int)header->width - x);
++            row[3] = FFMIN(16, (int)header->height - y);
++        }
++    }
++
+     if (pic->needs_fg) {
+         pic->f_grain->format = pic->f->format;
+         pic->f_grain->width = pic->f->width;
+diff --git a/libavcodec/ouroboros_h264_residual.h b/libavcodec/ouroboros_h264_residual.h
+new file mode 100644
+index 0000000..52b71ea
+--- /dev/null
++++ b/libavcodec/ouroboros_h264_residual.h
+@@ -0,0 +1,183 @@
++/*
++ * Internal Ouroboros H.264 decoder instrumentation.
++ *
++ * This payload is attached as AV_FRAME_DATA_OUROBOROS_H264_RESIDUAL. It is
++ * decoder-generated side data, not H.264 SEI and not transform coefficients.
++ */
++#ifndef AVCODEC_OUROBOROS_H264_RESIDUAL_H
++#define AVCODEC_OUROBOROS_H264_RESIDUAL_H
++
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++
++#include "libavutil/attributes.h"
++#include "libavutil/frame.h"
++
++#define OUROBOROS_RESIDUAL_VERSION 2U
++#define OUROBOROS_RESIDUAL_COLUMNS 10U
++#define OUROBOROS_RESIDUAL_FLAG_VALIDATION (1U << 0)
++
++static const uint8_t ff_ouroboros_residual_uuid[16] = {
++    'O', 'U', 'R', 'O', 'B', 'O', 'R', 'O',
++    'S', 'H', '2', '6', '4', 'R', '2', '\0'
++};
++
++typedef struct OuroborosResidualHeader {
++    uint8_t uuid[16];
++    uint32_t version;
++    uint32_t width;
++    uint32_t height;
++    uint32_t chroma_width;
++    uint32_t chroma_height;
++    uint32_t mb_width;
++    uint32_t mb_height;
++    uint32_t flags;
++    uint32_t payload_bytes;
++} OuroborosResidualHeader;
++
++static av_always_inline size_t ff_ouroboros_y_count(
++    const OuroborosResidualHeader *header)
++{
++    return (size_t)header->width * header->height;
++}
++
++static av_always_inline size_t ff_ouroboros_c_count(
++    const OuroborosResidualHeader *header)
++{
++    return (size_t)header->chroma_width * header->chroma_height;
++}
++
++static av_always_inline size_t ff_ouroboros_summary_count(
++    const OuroborosResidualHeader *header)
++{
++    return (size_t)header->mb_width * header->mb_height *
++           OUROBOROS_RESIDUAL_COLUMNS;
++}
++
++static av_always_inline size_t ff_ouroboros_payload_size(
++    uint32_t width, uint32_t height, uint32_t flags)
++{
++    const size_t y_count = (size_t)width * height;
++    const size_t c_count = (size_t)((width + 1) / 2) * ((height + 1) / 2);
++    const size_t sample_count = y_count + 2 * c_count;
++    const size_t mb_count = (size_t)((width + 15) / 16) *
++                            ((height + 15) / 16);
++    size_t size = sizeof(OuroborosResidualHeader);
++    size += sample_count * sizeof(int16_t);
++    size += sample_count * sizeof(uint8_t);
++    if (flags & OUROBOROS_RESIDUAL_FLAG_VALIDATION)
++        size += 2 * sample_count * sizeof(uint8_t);
++    size = (size + sizeof(float) - 1) & ~(sizeof(float) - 1);
++    size += mb_count * OUROBOROS_RESIDUAL_COLUMNS * sizeof(float);
++    return size;
++}
++
++static av_always_inline AVFrameSideData *ff_ouroboros_residual_side_data(
++    AVFrame *frame)
++{
++    AVFrameSideData *side = av_frame_get_side_data(
++        frame, AV_FRAME_DATA_OUROBOROS_H264_RESIDUAL);
++    OuroborosResidualHeader *header;
++    if (!side || side->size < sizeof(*header))
++        return NULL;
++    header = (OuroborosResidualHeader *)side->data;
++    if (memcmp(header->uuid, ff_ouroboros_residual_uuid,
++               sizeof(header->uuid)) ||
++        header->version != OUROBOROS_RESIDUAL_VERSION ||
++        header->payload_bytes != side->size)
++        return NULL;
++    return side;
++}
++
++static av_always_inline int16_t *ff_ouroboros_residual_y(
++    OuroborosResidualHeader *header)
++{
++    return (int16_t *)(header + 1);
++}
++
++static av_always_inline int16_t *ff_ouroboros_residual_u(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_residual_y(header) + ff_ouroboros_y_count(header);
++}
++
++static av_always_inline int16_t *ff_ouroboros_residual_v(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_residual_u(header) + ff_ouroboros_c_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_valid_y(
++    OuroborosResidualHeader *header)
++{
++    return (uint8_t *)(ff_ouroboros_residual_v(header) +
++                       ff_ouroboros_c_count(header));
++}
++
++static av_always_inline uint8_t *ff_ouroboros_valid_u(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_valid_y(header) + ff_ouroboros_y_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_valid_v(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_valid_u(header) + ff_ouroboros_c_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_prediction_y(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_valid_v(header) + ff_ouroboros_c_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_prediction_u(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_prediction_y(header) + ff_ouroboros_y_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_prediction_v(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_prediction_u(header) + ff_ouroboros_c_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_reconstruction_y(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_prediction_v(header) + ff_ouroboros_c_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_reconstruction_u(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_reconstruction_y(header) +
++           ff_ouroboros_y_count(header);
++}
++
++static av_always_inline uint8_t *ff_ouroboros_reconstruction_v(
++    OuroborosResidualHeader *header)
++{
++    return ff_ouroboros_reconstruction_u(header) +
++           ff_ouroboros_c_count(header);
++}
++
++static av_always_inline float *ff_ouroboros_coefficient_summaries(
++    OuroborosResidualHeader *header)
++{
++    uint8_t *cursor = ff_ouroboros_valid_v(header) +
++                      ff_ouroboros_c_count(header);
++    if (header->flags & OUROBOROS_RESIDUAL_FLAG_VALIDATION)
++        cursor += 2 * (ff_ouroboros_y_count(header) +
++                       2 * ff_ouroboros_c_count(header));
++    {
++        size_t offset = (size_t)(cursor - (uint8_t *)header);
++        offset = (offset + sizeof(float) - 1) & ~(sizeof(float) - 1);
++        return (float *)((uint8_t *)header + offset);
++    }
++}
++
++#endif
+diff --git a/libavutil/frame.h b/libavutil/frame.h
+index d440cfb..b827793 100644
+--- a/libavutil/frame.h
++++ b/libavutil/frame.h
+@@ -254,6 +254,12 @@ enum AVFrameSideDataType {
+      * libavutil/tdrdi.h.
+      */
+     AV_FRAME_DATA_3D_REFERENCE_DISPLAYS,
++
++    /**
++     * Internal Ouroboros instrumentation for exact H.264 effective residuals.
++     * The payload is versioned and UUID-namespaced; it is not bitstream SEI.
++     */
++    AV_FRAME_DATA_OUROBOROS_H264_RESIDUAL,
+ };
+ 
+ enum AVActiveFormatDescription {

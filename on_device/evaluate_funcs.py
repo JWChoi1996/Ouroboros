@@ -22,8 +22,6 @@ from datasets.vid import VIDResize, VID
 from ipconv.models import (
     MaskedRCNN_ViT_B_FPN_Contexted, MaskedRCNN_ViT_L_FPN_Contexted, MaskedRCNN_ViT_H_FPN_Contexted,
     CascadeMaskRCNN_Swin_B_Contexted, CascadeMaskRCNN_Swin_L_Contexted, CascadeMaskRCNN_MViT_B_Contexted,
-    DINO_4Scale_Swin_Contexted, DINO_5Scale_Swin_Contexted,
-    LWDETR_xLarge_Contexted
 )
 from ipconv.models.ViTDet.modeling.backbone.utils import window_reverse, window_partition
 
@@ -39,12 +37,18 @@ def prepare_environment(args) -> Tuple[Any, Dict[str, List[Tuple[torch.Tensor, D
         "vitdet-b": MaskedRCNN_ViT_B_FPN_Contexted,
         "vitdet-l": MaskedRCNN_ViT_L_FPN_Contexted,
         "vitdet-h": MaskedRCNN_ViT_H_FPN_Contexted,
-        "dino-swin4": DINO_4Scale_Swin_Contexted,
-        "lwdetr": LWDETR_xLarge_Contexted,
         "swin-b": CascadeMaskRCNN_Swin_B_Contexted,
         "swin-l": CascadeMaskRCNN_Swin_L_Contexted,
         "mvit-b": CascadeMaskRCNN_MViT_B_Contexted,
     }
+    if args.model == "dino-swin4":
+        from ipconv.models import DINO_4Scale_Swin_Contexted
+
+        models_dict["dino-swin4"] = DINO_4Scale_Swin_Contexted
+    elif args.model == "lwdetr":
+        from ipconv.models import LWDETR_xLarge_Contexted
+
+        models_dict["lwdetr"] = LWDETR_xLarge_Contexted
 
     models_weight_dict = {
         # "vitdet-b-imnetvid": "./weights/frcnn_vitdet_final.pth",  # 이 부분!

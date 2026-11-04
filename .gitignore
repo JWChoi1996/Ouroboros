@@ -184,3 +184,16 @@ logs
 
 */output
 *.out
+
+weights
+docs
+data
+tests
+results
+
+# Repository-local patched FFmpeg generated artifacts
+on_device/codec_backend/build/
+on_device/codec_backend/backend_manifest.json
+
+results/*.json
+!results/.gitkeep
