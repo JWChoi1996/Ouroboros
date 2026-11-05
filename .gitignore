@@ -175,7 +175,7 @@ cython_debug/
 
 *.mp4
 *.pkl
-data
+/data
 logs
 .vscode
 *.jpg
@@ -185,15 +185,11 @@ logs
 */output
 *.out
 
-weights
-docs
-data
-tests
-results
+/weights
+/results/**
+!/results/.gitkeep
+on_device/ipconv/models/ViTDet/data/
 
 # Repository-local patched FFmpeg generated artifacts
 on_device/codec_backend/build/
 on_device/codec_backend/backend_manifest.json
-
-results/*.json
-!results/.gitkeep

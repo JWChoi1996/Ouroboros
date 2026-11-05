@@ -3,7 +3,9 @@ import pickle
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from functools import partial
+from contextlib import contextmanager
+from functools import partial, wraps
+import inspect
 
 import numpy as np
 import os
@@ -27,6 +29,45 @@ from ..proc_image import (
     calculate_multi_iou, calculate_iou, visualize_detection, refine_images,
     graph_iou, graph_recompute
 )
+
+
+def _timed_call(timer, name, operation):
+    if timer is None:
+        return operation()
+    with timer.stage(name, cuda=True):
+        return operation()
+
+
+@contextmanager
+def _timed_stage(timer, name):
+    if timer is None:
+        yield
+        return
+    with timer.stage(name, cuda=True):
+        yield
+
+
+def _timed_model_total(method):
+    signature = inspect.signature(method)
+
+    @wraps(method)
+    def wrapped(*args, **kwargs):
+        timer = signature.bind_partial(*args, **kwargs).arguments.get("timer")
+        with _timed_stage(timer, "model_total"):
+            return method(*args, **kwargs)
+
+    return wrapped
+
+
+def _store(mapping, key, value):
+    mapping[key] = value
+    return value
+
+
+def _scatter(target, index, value):
+    target[index] = value
+    return target
+
 
 class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
     def __init__(self, device="cuda:0", dataset_name="coco"):
@@ -84,30 +125,48 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         self.add_decomposed_rel_pos = AddDecomposedRelPos()
 
     @torch.no_grad()
-    def forward(self, image_ndarray: np.ndarray, *args, **kwargs):
+    @_timed_model_total
+    def forward(self, image_ndarray: np.ndarray, *args, timer=None, **kwargs):
         only_backbone = kwargs.get("only_backbone", False)
 
         # image_ndarray: (H, W, C)
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8, device=self.device).permute(2, 0, 1)
-        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
-        
-        # detections = self.base_model(input)
-        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
-        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.base_model.backbone.size_divisibility,
-            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
-        )
+        with _timed_stage(timer, "model_preprocess"):
+            image_tensor = torch.tensor(
+                image_ndarray, dtype=torch.uint8, device=self.device
+            ).permute(2, 0, 1)
+            input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
 
-        features = self.base_model.backbone(images.tensor)
+            # detections = self.base_model(input)
+            images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+            images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+            images = ImageList.from_tensors(
+                images,
+                self.base_model.backbone.size_divisibility,
+                padding_constraints=self.base_model.backbone.padding_constraints,
+            )
+
+        features = _timed_call(
+            timer, "dense_backbone", lambda: self.base_model.backbone(images.tensor)
+        )
         
         if only_backbone:
             return ([], [], []), {}
         
-        proposals, _ = self.proposal_generator(images, features, None)
-        results, _ = self.roi_heads(images, features, proposals, None)
-        detections = self._postprocess(results, input, images.image_sizes)
+        proposals, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.proposal_generator(images, features, None),
+        )
+        results, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.roi_heads(images, features, proposals, None),
+        )
+        detections = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model._postprocess(results, input, images.image_sizes),
+        )
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
@@ -117,41 +176,46 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         return boxes, labels, scores
 
     @torch.no_grad()
+    @_timed_model_total
     def forward_contexted(
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
             dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:0"),
             only_backbone: bool = False,
+            timer=None,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
         new_cache_feature = {}
         
-        # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
-        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
-        
-        # preprocess
-        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
-        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.base_model.backbone.size_divisibility,
-            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
-        )
+        with _timed_stage(timer, "model_preprocess"):
+            image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+            input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+
+            images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+            images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+            images = ImageList.from_tensors(
+                images,
+                self.base_model.backbone.size_divisibility,
+                padding_constraints=self.base_model.backbone.padding_constraints,
+            )
 
         # inference: backbone
         backbone = self.base_model.backbone
         net = backbone.net
 
         # > ViT
-        x = net.patch_embed(images.tensor)
+        x = _timed_call(
+            timer, "patch_embedding", lambda: net.patch_embed(images.tensor)
+        )
         ape = get_abs_pos(
             net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
         )
         if net.pos_embed is not None:
-            x = self.add(x, ape)
+            x = _timed_call(
+                timer, "patch_embedding", lambda: self.add(x, ape)
+            )
         
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
@@ -186,10 +250,25 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             # partial QKV generation
             x_attn_flat = x_attn.reshape(-1, self.embed_dim)
             x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-            qkv_selected = block.attn.qkv(x_attn_selected)
+            qkv_selected = _timed_call(
+                timer, "block_qkv", lambda: block.attn.qkv(x_attn_selected)
+            )
 
-            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=x_attn.dtype)
-            qkv_flat[selected_indices, :] = qkv_selected
+            qkv_flat = _timed_call(
+                timer,
+                "block_qkv",
+                lambda: torch.zeros(
+                    B_attn * H_attn * W_attn,
+                    3 * self.embed_dim,
+                    device=self.device,
+                    dtype=x_attn.dtype,
+                ),
+            )
+            qkv_flat = _timed_call(
+                timer,
+                "block_qkv",
+                lambda: _scatter(qkv_flat, (selected_indices, slice(None)), qkv_selected),
+            )
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
@@ -197,17 +276,30 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if fname in anchor_features:
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-                kv_cached = anchor_features[fname]
-                qkv_cached = torch.zeros_like(qkv)
+                kv_cached = _timed_call(
+                    timer, "block_cache", lambda: anchor_features[fname]
+                )
                 # qkv_cached[1:] = self.add(qkv[1:] * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
-                qkv_cached = self.add(qkv * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable))
+                qkv_cached = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: self.add(qkv * dmap_broadcastable, kv_cached * (1 - dmap_broadcastable)),
+                )
                 qkv = qkv_cached
             # new_cache_feature[fname] = qkv.clone()[1:]
-            new_cache_feature[fname] = qkv.clone()
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, qkv.clone()),
+            )
 
             fname = f"block{bidx}_qkvpe"
             if fname in anchor_features:
-                new_cache_feature[fname] = anchor_features[fname]
+                _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: _store(new_cache_feature, fname, anchor_features[fname]),
+                )
             else:
                 if block.window_size > 0:
                     ape_block, _ = window_partition(ape, block.window_size)
@@ -218,50 +310,147 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 # ape_block = block.attn.qkv(ape_block).reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # ape_block with shape (3, B_attn, nHead, H_attn * W_attn, C)
                 
                 # new_cache_feature[fname] = ape_block.clone()[1:]  # for strict cache size management
-                new_cache_feature[fname] = ape_block.clone() # for easy inference
+                _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: _store(new_cache_feature, fname, ape_block.clone()),
+                )
 
             fname = f"block{bidx}_std"
             x_std, _ = window_partition(x_std, block.window_size) if block.window_size > 0 else (x_std, None)
-            new_cache_feature[fname] = x_std.clone()
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, x_std.clone()),
+            )
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
             # partial attention
             if bidx in self.window_block_indexes:   # window attention
-                attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q * block.attn.scale), k.transpose(-2, -1)),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn)),
+                    )
 
                 # projection
-                attn = attn.softmax(dim=-1)
-                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                attn = _timed_call(
+                    timer, "block_attention", lambda: attn.softmax(dim=-1)
+                )
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: self.matmul(attn, v)
+                ).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
 
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
                 x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-                x_attn_selected = block.attn.proj(x_attn_selected)
-                x_attn = torch.zeros(B_attn * H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[selected_indices, :] = x_attn_selected.view(-1, x_attn_selected.shape[-1])
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: block.attn.proj(x_attn_selected),
+                )
+                x_attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn * H_attn * W_attn,
+                        x_attn_selected.shape[-1],
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        x_attn,
+                        (selected_indices, slice(None)),
+                        x_attn_selected.view(-1, x_attn_selected.shape[-1]),
+                    ),
+                )
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
             else:   # global attention
                 q_selected = q[:, selected_indices, :]
                 num_selected = q_selected.shape[1]
 
-                attn_selected = self.matmul((q_selected * block.attn.scale), k.transpose(-2, -1))
-                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
-                attn[:, selected_indices, :] = attn_selected
+                attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q_selected * block.attn.scale), k.transpose(-2, -1)),
+                )
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn * block.attn.num_heads,
+                        H_attn * W_attn,
+                        H_attn * W_attn,
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        attn,
+                        (slice(None), selected_indices, slice(None)),
+                        attn_selected,
+                    ),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now),
+                    )
 
                 # projection
-                attn_selected = attn[:, selected_indices, :].softmax(dim=-1)
-                x_attn_selected = self.matmul(attn_selected, v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
-                x_attn_selected = block.attn.proj(x_attn_selected)
+                attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: attn[:, selected_indices, :].softmax(dim=-1),
+                )
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul(attn_selected, v),
+                ).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: block.attn.proj(x_attn_selected),
+                )
 
-                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[:, selected_indices, :] = x_attn_selected
+                x_attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn,
+                        H_attn * W_attn,
+                        x_attn_selected.shape[-1],
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        x_attn,
+                        (slice(None), selected_indices, slice(None)),
+                        x_attn_selected,
+                    ),
+                )
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
             x = x_attn
@@ -276,11 +465,15 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             shortcut2 = x
             x_norm2 = block.norm2(x)
 
-            x_mlp_out = partial_mlp_inference(
-                x_norm2,           # (B, H, W, C)
-                dmap_block,        # (B, H, W, 1)
-                block.mlp, 
-                block.drop_path
+            x_mlp_out = _timed_call(
+                timer,
+                "block_mlp",
+                lambda: partial_mlp_inference(
+                    x_norm2,
+                    dmap_block,
+                    block.mlp,
+                    block.drop_path,
+                ),
             )
             x = self.add(shortcut2, x_mlp_out)
 
@@ -292,8 +485,16 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         if fname in anchor_features:
             # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
             dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-            x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-        new_cache_feature[fname] = x.clone()
+            x = _timed_call(
+                timer,
+                "block_cache",
+                lambda: self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled)),
+            )
+        _timed_call(
+            timer,
+            "block_cache",
+            lambda: _store(new_cache_feature, fname, x.clone()),
+        )
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -304,25 +505,43 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
         results = []
         for stage in backbone.stages:
-            results.append(stage(features))
+            results.append(
+                _timed_call(timer, "fpn", lambda stage=stage: stage(features))
+            )
 
         if backbone.top_block is not None:
             if backbone.top_block.in_feature in bottom_up_features:
                 top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
             else:
                 top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
-            results.extend(backbone.top_block(top_block_in_feature))
+            results.extend(
+                _timed_call(
+                    timer, "fpn", lambda: backbone.top_block(top_block_in_feature)
+                )
+            )
         assert len(backbone._out_features) == len(results)
         features = {f: res for f, res in zip(backbone._out_features, results)}
 
         # inference: RPN
 
         # > proposal_generator
-        proposals, _ = self.base_model.proposal_generator(images, features, None)
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+        proposals, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.proposal_generator(images, features, None),
+        )
+        results, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.roi_heads(images, features, proposals, None),
+        )
 
         # postprocess
-        detections = self.base_model._postprocess(results, input, images.image_sizes)
+        detections = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model._postprocess(results, input, images.image_sizes),
+        )
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
@@ -333,41 +552,46 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         return (boxes, labels, scores), new_cache_feature, pred_masks
     
     @torch.no_grad()
+    @_timed_model_total
     def forward_eventful(
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
             dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:0"),
             only_backbone: bool = False,
+            timer=None,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
         new_cache_feature = {}
         
-        # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
-        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
-        
-        # preprocess
-        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
-        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.base_model.backbone.size_divisibility,
-            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
-        )
+        with _timed_stage(timer, "model_preprocess"):
+            image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+            input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+
+            images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+            images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+            images = ImageList.from_tensors(
+                images,
+                self.base_model.backbone.size_divisibility,
+                padding_constraints=self.base_model.backbone.padding_constraints,
+            )
 
         # inference: backbone
         backbone = self.base_model.backbone
         net = backbone.net
 
         # > ViT
-        x = net.patch_embed(images.tensor)
+        x = _timed_call(
+            timer, "patch_embedding", lambda: net.patch_embed(images.tensor)
+        )
         ape = get_abs_pos(
             net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
         )
         if net.pos_embed is not None:
-            x = self.add(x, ape)
+            x = _timed_call(
+                timer, "patch_embedding", lambda: self.add(x, ape)
+            )
         
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
@@ -401,10 +625,25 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             # partial QKV generation
             x_attn_flat = x_attn.reshape(-1, self.embed_dim)
             x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-            qkv_selected = block.attn.qkv(x_attn_selected)
+            qkv_selected = _timed_call(
+                timer, "block_qkv", lambda: block.attn.qkv(x_attn_selected)
+            )
 
-            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=x_attn.dtype)
-            qkv_flat[selected_indices, :] = qkv_selected
+            qkv_flat = _timed_call(
+                timer,
+                "block_qkv",
+                lambda: torch.zeros(
+                    B_attn * H_attn * W_attn,
+                    3 * self.embed_dim,
+                    device=self.device,
+                    dtype=x_attn.dtype,
+                ),
+            )
+            qkv_flat = _timed_call(
+                timer,
+                "block_qkv",
+                lambda: _scatter(qkv_flat, (selected_indices, slice(None)), qkv_selected),
+            )
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
@@ -412,26 +651,52 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if fname in anchor_features:
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-                qkv = self.add(qkv * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
-            new_cache_feature[fname] = qkv
+                qkv = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: self.add(qkv * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable)),
+                )
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, qkv),
+            )
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
             # partial attention
             if bidx in self.window_block_indexes:   # window attention
-                attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q * block.attn.scale), k.transpose(-2, -1)),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn)),
+                    )
 
                 # projection
-                attn = attn.softmax(dim=-1)
-                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-                x_attn = block.attn.proj(x_attn)
+                attn = _timed_call(
+                    timer, "block_attention", lambda: attn.softmax(dim=-1)
+                )
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: self.matmul(attn, v)
+                ).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: block.attn.proj(x_attn)
+                )
 
             else:   # global attention
                 fname = f"block{bidx}_qkv"
-                qkv_cache = anchor_features[fname] if fname in anchor_features else torch.zeros_like(qkv)
+                qkv_cache = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: anchor_features[fname] if fname in anchor_features else torch.zeros_like(qkv),
+                )
                 q_cache, k_cache, v_cache = qkv_cache.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)
 
                 q_selected = q[:, selected_indices, :]
@@ -439,46 +704,150 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 v_selected = v[:, selected_indices, :]
                 num_selected = q_selected.shape[1]
 
-                attn_selected_row = self.matmul((q_selected * block.attn.scale), k.transpose(-2, -1))
-                attn_selected_col = self.matmul((q * block.attn.scale), k_selected.transpose(-2, -1))
-                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
-                attn[:, selected_indices, :] = attn_selected_row
-                attn[:, :, selected_indices] = attn_selected_col
+                attn_selected_row = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q_selected * block.attn.scale), k.transpose(-2, -1)),
+                )
+                attn_selected_col = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q * block.attn.scale), k_selected.transpose(-2, -1)),
+                )
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn * block.attn.num_heads,
+                        H_attn * W_attn,
+                        H_attn * W_attn,
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        attn,
+                        (slice(None), selected_indices, slice(None)),
+                        attn_selected_row,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        attn,
+                        (slice(None), slice(None), selected_indices),
+                        attn_selected_col,
+                    ),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now),
+                    )
 
-                attn = attn.softmax(dim=-1)
+                attn = _timed_call(
+                    timer, "block_attention", lambda: attn.softmax(dim=-1)
+                )
 
                 fname = f"block{bidx}_attn"
-                attn_cache = anchor_features[fname] if fname in anchor_features else None
-                new_cache_feature[fname] = attn
+                attn_cache = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: anchor_features[fname] if fname in anchor_features else None,
+                )
+                _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: _store(new_cache_feature, fname, attn),
+                )
 
                 # Attn_V update
                 fname = f"block{bidx}_attn_v"
-                AV_old = anchor_features[fname] if fname in anchor_features else None
-                AV_diff = self.add(attn, (-1) * attn_cache) if attn_cache is not None else attn
+                AV_old = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: anchor_features[fname] if fname in anchor_features else None,
+                )
+                AV_diff = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.add(attn, (-1) * attn_cache) if attn_cache is not None else attn,
+                )
                 AV_diff_selected = AV_diff[:, :, selected_indices]
 
                 v_cache_selected = v_cache[:, selected_indices, :]
-                v_diff_selected = self.add(v_selected, (-1) * v_cache_selected)
-                v_temp_selected = self.add(v_selected, (-1) * v_diff_selected)
+                v_diff_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.add(v_selected, (-1) * v_cache_selected),
+                )
+                v_temp_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.add(v_selected, (-1) * v_diff_selected),
+                )
 
-                AnVdiff = self.matmul(attn[:, :, selected_indices], v_diff_selected)
+                AnVdiff = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul(attn[:, :, selected_indices], v_diff_selected),
+                )
 
-                AV_update = self.matmul(AV_diff_selected, v_temp_selected)
+                AV_update = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul(AV_diff_selected, v_temp_selected),
+                )
 
-                AV = self.add(self.add(AV_old, AnVdiff), AV_update) if AV_old is not None else self.add(AnVdiff, AV_update)
+                AV = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.add(self.add(AV_old, AnVdiff), AV_update)
+                    if AV_old is not None
+                    else self.add(AnVdiff, AV_update),
+                )
 
-                new_cache_feature[fname] = AV
+                _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: _store(new_cache_feature, fname, AV),
+                )
 
                 # projection
                 attn_selected = AV[:, selected_indices, :]
                 x_attn_selected = attn_selected.view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
-                x_attn_selected = block.attn.proj(x_attn_selected)
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: block.attn.proj(x_attn_selected),
+                )
 
-                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[:, selected_indices, :] = x_attn_selected
+                x_attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn,
+                        H_attn * W_attn,
+                        x_attn_selected.shape[-1],
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        x_attn,
+                        (slice(None), selected_indices, slice(None)),
+                        x_attn_selected,
+                    ),
+                )
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
             x = x_attn
@@ -493,11 +862,15 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             shortcut2 = x
             x_norm2 = block.norm2(x)
 
-            x_mlp_out = partial_mlp_inference(
-                x_norm2,           # (B, H, W, C)
-                dmap_block,        # (B, H, W, 1)
-                block.mlp, 
-                block.drop_path
+            x_mlp_out = _timed_call(
+                timer,
+                "block_mlp",
+                lambda: partial_mlp_inference(
+                    x_norm2,
+                    dmap_block,
+                    block.mlp,
+                    block.drop_path,
+                ),
             )
             x = self.add(shortcut2, x_mlp_out)
 
@@ -509,8 +882,14 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         if fname in anchor_features:
             # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
             dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-            x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-        new_cache_feature[fname] = x
+            x = _timed_call(
+                timer,
+                "block_cache",
+                lambda: self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled)),
+            )
+        _timed_call(
+            timer, "block_cache", lambda: _store(new_cache_feature, fname, x)
+        )
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -521,25 +900,43 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
         results = []
         for stage in backbone.stages:
-            results.append(stage(features))
+            results.append(
+                _timed_call(timer, "fpn", lambda stage=stage: stage(features))
+            )
 
         if backbone.top_block is not None:
             if backbone.top_block.in_feature in bottom_up_features:
                 top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
             else:
                 top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
-            results.extend(backbone.top_block(top_block_in_feature))
+            results.extend(
+                _timed_call(
+                    timer, "fpn", lambda: backbone.top_block(top_block_in_feature)
+                )
+            )
         assert len(backbone._out_features) == len(results)
         features = {f: res for f, res in zip(backbone._out_features, results)}
 
         # inference: RPN
 
         # > proposal_generator
-        proposals, _ = self.base_model.proposal_generator(images, features, None)
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+        proposals, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.proposal_generator(images, features, None),
+        )
+        results, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.roi_heads(images, features, proposals, None),
+        )
 
         # postprocess
-        detections = self.base_model._postprocess(results, input, images.image_sizes)
+        detections = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model._postprocess(results, input, images.image_sizes),
+        )
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
@@ -551,41 +948,46 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         return (boxes, labels, scores), new_cache_feature, pred_masks
 
     @torch.no_grad()
+    @_timed_model_total
     def forward_maskvd(
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
             dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:0"),
             only_backbone: bool = False,
+            timer=None,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
         new_cache_feature = {}
         
-        # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
-        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
-        
-        # preprocess
-        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
-        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.base_model.backbone.size_divisibility,
-            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
-        )
+        with _timed_stage(timer, "model_preprocess"):
+            image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+            input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+
+            images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+            images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+            images = ImageList.from_tensors(
+                images,
+                self.base_model.backbone.size_divisibility,
+                padding_constraints=self.base_model.backbone.padding_constraints,
+            )
 
         # inference: backbone
         backbone = self.base_model.backbone
         net = backbone.net
 
         # > ViT
-        x = net.patch_embed(images.tensor)
+        x = _timed_call(
+            timer, "patch_embedding", lambda: net.patch_embed(images.tensor)
+        )
         ape = get_abs_pos(
             net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
         )
         if net.pos_embed is not None:
-            x = self.add(x, ape)
+            x = _timed_call(
+                timer, "patch_embedding", lambda: self.add(x, ape)
+            )
         
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
@@ -623,32 +1025,60 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             fname = f"block{bidx}_x_attn_flat"
             if fname in anchor_features:
-                x_attn_flat_cached = anchor_features[fname]
-                x_attn_flat_cached[selected_indices] = x_attn_selected
+                x_attn_flat_cached = _timed_call(
+                    timer, "block_cache", lambda: anchor_features[fname]
+                )
+                _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: _scatter(x_attn_flat_cached, selected_indices, x_attn_selected),
+                )
                 x_attn_selected = x_attn_flat_cached
             else:
                 x_attn_selected = x_attn_flat
-            new_cache_feature[fname] = x_attn_selected
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, x_attn_selected),
+            )
             
-            qkv = block.attn.qkv(x_attn_selected)
+            qkv = _timed_call(
+                timer, "block_qkv", lambda: block.attn.qkv(x_attn_selected)
+            )
             qkv = qkv.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
             # partial attention
             if bidx in self.window_block_indexes:   # window attention
-                attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q * block.attn.scale), k.transpose(-2, -1)),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn)),
+                    )
 
                 # projection
-                attn = attn.softmax(dim=-1)
-                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                attn = _timed_call(
+                    timer, "block_attention", lambda: attn.softmax(dim=-1)
+                )
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: self.matmul(attn, v)
+                ).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
 
                 x_attn_flat = x_attn.reshape(-1, x_attn.shape[-1])
                 x_attn_selected = x_attn_flat
-                x_attn_selected = block.attn.proj(x_attn_selected)
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: block.attn.proj(x_attn_selected),
+                )
                 x_attn = x_attn_selected.view(B_attn, H_attn, W_attn, -1)
 
             else:   # global attention
@@ -656,21 +1086,81 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
                 k_selected = k[:, selected_indices, :]
                 num_selected = q_selected.shape[1]
 
-                attn_selected = self.matmul((q_selected * block.attn.scale), k_selected.transpose(-2, -1))
-                attn = torch.zeros(B_attn * block.attn.num_heads, H_attn * W_attn, H_attn * W_attn, device=self.device, dtype=x_attn.dtype)
-                attn[:, selected_indices[:, None], selected_indices[None, :]] = attn_selected
+                attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q_selected * block.attn.scale), k_selected.transpose(-2, -1)),
+                )
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn * block.attn.num_heads,
+                        H_attn * W_attn,
+                        H_attn * W_attn,
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        attn,
+                        (
+                            slice(None),
+                            selected_indices[:, None],
+                            selected_indices[None, :],
+                        ),
+                        attn_selected,
+                    ),
+                )
 
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now)
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn), dmap_now),
+                    )
 
                 # projection
-                attn_selected = attn[:, selected_indices, :].softmax(dim=-1)
-                x_attn_selected = self.matmul(attn_selected, v).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
-                x_attn_selected = block.attn.proj(x_attn_selected)
+                attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: attn[:, selected_indices, :].softmax(dim=-1),
+                )
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul(attn_selected, v),
+                ).view(B_attn, block.attn.num_heads, num_selected, -1).permute(0, 2, 1, 3).reshape(B_attn, num_selected, -1)
+                x_attn_selected = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: block.attn.proj(x_attn_selected),
+                )
 
-                x_attn = torch.zeros(B_attn, H_attn * W_attn, x_attn_selected.shape[-1], device=self.device, dtype=x_attn.dtype)
-                x_attn[:, selected_indices, :] = x_attn_selected
+                x_attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: torch.zeros(
+                        B_attn,
+                        H_attn * W_attn,
+                        x_attn_selected.shape[-1],
+                        device=self.device,
+                        dtype=x_attn.dtype,
+                    ),
+                )
+                _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: _scatter(
+                        x_attn,
+                        (slice(None), selected_indices, slice(None)),
+                        x_attn_selected,
+                    ),
+                )
                 x_attn = x_attn.view(B_attn, H_attn, W_attn, -1)
 
             x = x_attn
@@ -685,11 +1175,15 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             shortcut2 = x
             x_norm2 = block.norm2(x)
 
-            x_mlp_out = partial_mlp_inference(
-                x_norm2,           # (B, H, W, C)
-                dmap_block,        # (B, H, W, 1)
-                block.mlp, 
-                block.drop_path
+            x_mlp_out = _timed_call(
+                timer,
+                "block_mlp",
+                lambda: partial_mlp_inference(
+                    x_norm2,
+                    dmap_block,
+                    block.mlp,
+                    block.drop_path,
+                ),
             )
             x = self.add(shortcut2, x_mlp_out)
 
@@ -701,8 +1195,16 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         if fname in anchor_features:
             # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
             dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-            x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-        new_cache_feature[fname] = x.clone()
+            x = _timed_call(
+                timer,
+                "block_cache",
+                lambda: self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled)),
+            )
+        _timed_call(
+            timer,
+            "block_cache",
+            lambda: _store(new_cache_feature, fname, x.clone()),
+        )
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -713,25 +1215,43 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
         results = []
         for stage in backbone.stages:
-            results.append(stage(features))
+            results.append(
+                _timed_call(timer, "fpn", lambda stage=stage: stage(features))
+            )
 
         if backbone.top_block is not None:
             if backbone.top_block.in_feature in bottom_up_features:
                 top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
             else:
                 top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
-            results.extend(backbone.top_block(top_block_in_feature))
+            results.extend(
+                _timed_call(
+                    timer, "fpn", lambda: backbone.top_block(top_block_in_feature)
+                )
+            )
         assert len(backbone._out_features) == len(results)
         features = {f: res for f, res in zip(backbone._out_features, results)}
 
         # inference: RPN
 
         # > proposal_generator
-        proposals, _ = self.base_model.proposal_generator(images, features, None)
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+        proposals, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.proposal_generator(images, features, None),
+        )
+        results, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.roi_heads(images, features, proposals, None),
+        )
 
         # postprocess
-        detections = self.base_model._postprocess(results, input, images.image_sizes)
+        detections = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model._postprocess(results, input, images.image_sizes),
+        )
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
@@ -742,41 +1262,46 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         return (boxes, labels, scores), new_cache_feature, pred_masks
 
     @torch.no_grad()
+    @_timed_model_total
     def forward_stgt(
             self, 
             image_ndarray: np.ndarray, 
             anchor_features: Dict[str, torch.Tensor] = {},
             dirtiness_map: torch.Tensor = torch.ones(1, 64, 64, 1, device="cuda:0"),
             only_backbone: bool = False,
+            timer=None,
     ) -> Tuple[Tuple[np.ndarray, np.ndarray, np.ndarray], Dict[str, torch.Tensor]]:
         # image_ndarray: (H, W, C)
 
         new_cache_feature = {}
         
-        # convert to tensor
-        image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
-        input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
-        
-        # preprocess
-        images = [self.base_model._move_to_current_device(x["image"]) for x in input]
-        images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
-        images = ImageList.from_tensors(
-            images,
-            self.base_model.backbone.size_divisibility,
-            padding_constraints={"size_divisibility": self.base_model.backbone.size_divisibility, "padding_constraints": image_ndarray.shape[0]},
-        )
+        with _timed_stage(timer, "model_preprocess"):
+            image_tensor = torch.tensor(image_ndarray, dtype=torch.uint8).permute(2, 0, 1).to(self.device)
+            input = [{"image": image_tensor, "height": image_tensor.shape[-2], "width": image_tensor.shape[-1]}]
+
+            images = [self.base_model._move_to_current_device(x["image"]) for x in input]
+            images = [(x - self.base_model.pixel_mean) / self.base_model.pixel_std for x in images]
+            images = ImageList.from_tensors(
+                images,
+                self.base_model.backbone.size_divisibility,
+                padding_constraints=self.base_model.backbone.padding_constraints,
+            )
 
         # inference: backbone
         backbone = self.base_model.backbone
         net = backbone.net
 
         # > ViT
-        x = net.patch_embed(images.tensor)
+        x = _timed_call(
+            timer, "patch_embedding", lambda: net.patch_embed(images.tensor)
+        )
         ape = get_abs_pos(
             net.pos_embed, net.pretrain_use_cls_token, (x.shape[1], x.shape[2])
         )
         if net.pos_embed is not None:
-            x = self.add(x, ape)
+            x = _timed_call(
+                timer, "patch_embedding", lambda: self.add(x, ape)
+            )
         
         # x: Tensor(1, 64, 64, 768)
         # dirtiness_map: Tensor(1, 64, 64, 1)
@@ -811,10 +1336,25 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             # partial QKV generation
             x_attn_flat = x_attn.reshape(-1, self.embed_dim)
             x_attn_selected = F.embedding(selected_indices, x_attn_flat)
-            qkv_selected = block.attn.qkv(x_attn_selected)
+            qkv_selected = _timed_call(
+                timer, "block_qkv", lambda: block.attn.qkv(x_attn_selected)
+            )
 
-            qkv_flat = torch.zeros(B_attn * H_attn * W_attn, 3 * self.embed_dim, device=self.device, dtype=x_attn.dtype)
-            qkv_flat[selected_indices, :] = qkv_selected
+            qkv_flat = _timed_call(
+                timer,
+                "block_qkv",
+                lambda: torch.zeros(
+                    B_attn * H_attn * W_attn,
+                    3 * self.embed_dim,
+                    device=self.device,
+                    dtype=x_attn.dtype,
+                ),
+            )
+            qkv_flat = _timed_call(
+                timer,
+                "block_qkv",
+                lambda: _scatter(qkv_flat, (selected_indices, slice(None)), qkv_selected),
+            )
 
             qkv = qkv_flat.reshape(B_attn, H_attn * W_attn, 3, block.attn.num_heads, -1).permute(2, 0, 3, 1, 4)   # qkv with shape (3, B_attn, nHead, H_attn * W_attn, C)
 
@@ -822,42 +1362,88 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if fname in anchor_features:
                 dmap_channeled = dmap_now.reshape(B_attn, H_attn * W_attn)
                 dmap_broadcastable = dmap_channeled.unsqueeze(0).unsqueeze(2).unsqueeze(-1)
-                qkv_cached = anchor_features[fname]
-                qkv_cached = self.add(qkv * dmap_broadcastable, qkv_cached * (1 - dmap_broadcastable))
+                qkv_cached = _timed_call(
+                    timer, "block_cache", lambda: anchor_features[fname]
+                )
+                qkv_cached = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: self.add(qkv * dmap_broadcastable, qkv_cached * (1 - dmap_broadcastable)),
+                )
                 qkv = qkv_cached
-            new_cache_feature[fname] = qkv.clone()
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, qkv.clone()),
+            )
 
             q, k, v = qkv.reshape(3, B_attn * block.attn.num_heads, H_attn * W_attn, -1).unbind(0)  # q, k, v with shape (B_attn * nHead, H_attn * W_attn, C)
 
             # partial attention
             if bidx in self.window_block_indexes:   # window attention
-                attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q * block.attn.scale), k.transpose(-2, -1)),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn)),
+                    )
 
                 # projection
-                attn = attn.softmax(dim=-1)
-                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-                x_attn = block.attn.proj(x_attn)
+                attn = _timed_call(
+                    timer, "block_attention", lambda: attn.softmax(dim=-1)
+                )
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: self.matmul(attn, v)
+                ).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: block.attn.proj(x_attn)
+                )
 
             else:   # global attention
-                attn = self.matmul((q * block.attn.scale), k.transpose(-2, -1))
+                attn = _timed_call(
+                    timer,
+                    "block_attention",
+                    lambda: self.matmul((q * block.attn.scale), k.transpose(-2, -1)),
+                )
 
                 if block.attn.use_rel_pos:
-                    attn = self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn))
+                    attn = _timed_call(
+                        timer,
+                        "block_attention",
+                        lambda: self.add_decomposed_rel_pos(attn, q, block.attn.rel_pos_h, block.attn.rel_pos_w, (H_attn, W_attn), (H_attn, W_attn)),
+                    )
 
                 # projection
-                attn = attn.softmax(dim=-1)
-                x_attn = self.matmul(attn, v).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
-                x_attn = block.attn.proj(x_attn)
+                attn = _timed_call(
+                    timer, "block_attention", lambda: attn.softmax(dim=-1)
+                )
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: self.matmul(attn, v)
+                ).view(B_attn, block.attn.num_heads, H_attn, W_attn, -1).permute(0, 2, 3, 1, 4).reshape(B_attn, H_attn, W_attn, -1)
+                x_attn = _timed_call(
+                    timer, "block_attention", lambda: block.attn.proj(x_attn)
+                )
 
             fname = f"block{bidx}_attn_proj"
             if fname in anchor_features:
                 dmap_hw = dmap_channeled.reshape(B_attn, H_attn, W_attn)
                 dmap_broadcastable = dmap_hw.unsqueeze(-1)
-                x_attn = self.add(x_attn * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable))
-            new_cache_feature[fname] = x_attn.clone()
+                x_attn = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: self.add(x_attn * dmap_broadcastable, anchor_features[fname] * (1 - dmap_broadcastable)),
+                )
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, x_attn.clone()),
+            )
 
             x = x_attn
             
@@ -870,7 +1456,11 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
 
             shortcut2 = x
             x_norm2 = block.norm2(x)
-            x_mlp_out = block.drop_path(block.mlp(x_norm2))
+            x_mlp_out = _timed_call(
+                timer,
+                "block_mlp",
+                lambda: block.drop_path(block.mlp(x_norm2)),
+            )
 
             x = self.add(shortcut2, x_mlp_out)
 
@@ -881,8 +1471,16 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
             if fname in anchor_features:
                 # x: (1, 64, 64, 768), anchor_features[fname]: (1, 64, 64, 768)
                 dmap_channeled = dmap_block.expand(-1, -1, -1, x.shape[-1])    # (1, 64, 64, 768)
-                x = self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled))
-            new_cache_feature[fname] = x.clone()
+                x = _timed_call(
+                    timer,
+                    "block_cache",
+                    lambda: self.add(x * dmap_channeled, anchor_features[fname] * (1 - dmap_channeled)),
+                )
+            _timed_call(
+                timer,
+                "block_cache",
+                lambda: _store(new_cache_feature, fname, x.clone()),
+            )
 
         if only_backbone:
             return ([], [], []), new_cache_feature
@@ -893,25 +1491,43 @@ class MaskedRCNN_ViT_FPN_Contexted(ExtendedModule):
         features = bottom_up_features[backbone.in_feature]  # (1, 768, 64, 64)
         results = []
         for stage in backbone.stages:
-            results.append(stage(features))
+            results.append(
+                _timed_call(timer, "fpn", lambda stage=stage: stage(features))
+            )
 
         if backbone.top_block is not None:
             if backbone.top_block.in_feature in bottom_up_features:
                 top_block_in_feature = bottom_up_features[backbone.top_block.in_feature]
             else:
                 top_block_in_feature = results[backbone._out_features.index(backbone.top_block.in_feature)]
-            results.extend(backbone.top_block(top_block_in_feature))
+            results.extend(
+                _timed_call(
+                    timer, "fpn", lambda: backbone.top_block(top_block_in_feature)
+                )
+            )
         assert len(backbone._out_features) == len(results)
         features = {f: res for f, res in zip(backbone._out_features, results)}
 
         # inference: RPN
 
         # > proposal_generator
-        proposals, _ = self.base_model.proposal_generator(images, features, None)
-        results, _ = self.base_model.roi_heads(images, features, proposals, None)
+        proposals, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.proposal_generator(images, features, None),
+        )
+        results, _ = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model.roi_heads(images, features, proposals, None),
+        )
 
         # postprocess
-        detections = self.base_model._postprocess(results, input, images.image_sizes)
+        detections = _timed_call(
+            timer,
+            "detector_heads",
+            lambda: self.base_model._postprocess(results, input, images.image_sizes),
+        )
 
         predictions = detections[0]
         boxes = predictions["instances"].pred_boxes.tensor.cpu().numpy()
